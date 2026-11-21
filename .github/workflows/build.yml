@@ -866,8 +866,14 @@ jobs:
             echo "::warning::未找到 $F，跳过"
             exit 0
           fi
-          if ! grep -q "_av_fn" "$F"; then
-            echo "未出现 _av_fn 引用（上游可能已改为函数指针），跳过"
+          # 仅当确实存在「外部符号引用」形态才需要消除：
+          #   - extern void <name>(...);           (6.6+ 的 extern 声明)
+          #   - (void *)<name> != NULL             (6.6+ 的强转判空调用)
+          # 5.10 等内核里这两个符号是文件内 static 函数指针
+          #   static void (*<name>)(...);  +  if (<name>)
+          # 属于自包含实现，不存在 undefined symbol / GOT-PLT 问题，应跳过。
+          if ! grep -qE "extern[[:space:]]+void[[:space:]]+[a-z_]*_av_fn|\(void[[:space:]]*\*\)[a-z_]*_av_fn" "$F"; then
+            echo "未出现外部 _av_fn 符号引用（当前为文件内 static 实现或上游已修复），跳过"
             exit 0
           fi
 
