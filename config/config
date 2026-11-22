@@ -1,0 +1,61 @@
+# ==================== 自定义提交配置 ====================
+#
+# 本文件用于把 SUSFS / SukiSU 固定到指定提交，避免上游变动导致构建结果漂移。
+# 修改者：Eternal-Dash（2026-10）—— 补充生效条件说明与钉死原因，逻辑未变。
+#
+# 生效条件（重要）：
+#   · custom=true 且变体为 SukiSU 才会读取下面的 sukisu 项
+#   · 且必须启用 SUSFS（ksu_mode 不是“禁用SUSFS”/“禁用KSU”）
+#     因为下面钉的提交来自 builtin 分支，与 main 分支源码结构不通用；
+#     若在“关闭 SUSFS”时也套用它，会得到一个“关掉了 SUSFS 却仍内置 SUSFS”的内核。
+#
+# 取值说明：留空 = 使用该分支最新提交
+# ================================================================
+
+# 是否启用自定义提交 (true/false)
+custom=true
+
+# ==================== SUSFS 各分支的 commit hash ====================
+# 仅当 custom=true 时生效；留空 = 用最新
+#
+# 为什么要把 SUSFS 也钉住（2026-10-20）：
+#   SUSFS 上游在 2026-10-19 的 "kernel & KernelSU: Sync with the official KernelSU main repo"
+#   中，把 50_add_susfs 补丁改成依赖新版 KernelSU 的内核侧 API：
+#       ksu_setup_preinit_file / ksu_preinit_handle_post_execveat
+#       my_setprocattr / my_write_context / my_write_access
+#   而本仓库钉住的 SukiSU v4.2.1（builtin）里没有这些符号，于是链接期报
+#   "undefined symbol"，构建失败（log: fs/exec.c、security/selinux/hooks.c、selinuxfs.c）。
+#   因此这里钉到该同步提交的**父提交**：保留 "More fixes for selinux_hide" 的修复，
+#   但不引入需要新版 KSU 的 5 个符号（已逐个符号交叉验证）。
+#
+# 什么时候可以放开：
+#   · SukiSU 升级到包含 preinit / my_* API 的版本后，把下面清空即可跟随最新；
+#   · 或不升级 SukiSU，只把 SUSFS 更新到分界点之前。
+#
+# 注意：ShirkNeko/susfs4ksu 没有 gki-android16-6.12 分支（12/13/14/15 才有），
+#       6.12 会回退到 simonpunk/susfs4ksu，故这一项留空、不钉。
+#
+# 2026-10-21 结论（gki-android14-6.1 保持 2385dab4，不改提交）：
+#   尝试过降到 0f9e8265（2025-07-11）来匹配 6.1.138 的补丁上下文，结果失败：
+#   SukiSU builtin（v4.2.1 / 2026-10）的内核侧集成按新版 SUSFS API 编写，
+#   降级后出现 susfs_add_sus_map / CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING /
+#   susfs_get_enabled_features 签名不匹配等错误。
+#   故 SUSFS 与 SukiSU 必须同代；补丁上下文问题改由 apply.sh 的 .rej 兜底处理。
+gki-android12-5.10=31eb14add587b0a089dfe1819f92cc94920e141e
+gki-android13-5.15=a2dff232d075e033d43999a71deddaaa261aaf2e
+gki-android14-6.1=2385dab487c3abb8c4a2990ea5c852f55fb47dc8
+gki-android15-6.6=ebf876ee4ec4761989b30bc9d545d8e2b85c2270
+gki-android16-6.12=
+
+# ==================== SukiSU 的 commit hash ====================
+# 仅当 custom=true 且使用 SukiSU 变体、且启用 SUSFS 时生效
+#
+# 当前钉的是 builtin 分支的 v4.2.1 版本提交：
+#   · 只有 builtin 分支内置 SUSFS（main 分支不含 SUSFS，故不要改成 main 的提交）
+#   · 其后的提交引入了动态管理器，而该处存在上游编译错误，暂不跟进
+#
+# 换提交前请先确认：
+#   1) 仍属于 builtin 分支
+#   2) kernel/include/uapi/supercall.h 仍存在（否则 UAPI 修补会跳过、可能与管理器错配）
+#   3) kernel/feature/selinux_hide.c 的写法仍与修补正则匹配（看构建日志是否输出“已消除外部符号引用”）
+sukisu=1ba8414eab9797e61696560699b1f63850d3861a
