@@ -31,6 +31,13 @@ on:
           - Pre-Release
           - Release
         default: Actions
+      artifact_upload_mode:
+        description: "内核产物（仅 AK3 时跳过独立 Boot 镜像）"
+        type: choice
+        options:
+          - "仅上传 AnyKernel3.zip"
+          - "上传全部"
+        default: "仅上传 AnyKernel3.zip"
       kernelsu_variant:
         description: "KernelSU 变体"
         type: choice
@@ -166,7 +173,7 @@ jobs:
       export_susfs_patches: ${{ inputs.export_susfs_patches }}
       ksu_mode: ${{ inputs.ksu_mode }}
       droidspaces: ${{ inputs.droidspaces }}
-      artifact_upload_mode: "上传全部"
+      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
       called_from_main: true
 
@@ -188,7 +195,7 @@ jobs:
       export_susfs_patches: ${{ inputs.export_susfs_patches }}
       ksu_mode: ${{ inputs.ksu_mode }}
       droidspaces: ${{ inputs.droidspaces }}
-      artifact_upload_mode: "上传全部"
+      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
       called_from_main: true
 
@@ -210,7 +217,7 @@ jobs:
       export_susfs_patches: ${{ inputs.export_susfs_patches }}
       ksu_mode: ${{ inputs.ksu_mode }}
       droidspaces: ${{ inputs.droidspaces }}
-      artifact_upload_mode: "上传全部"
+      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
       called_from_main: true
 
@@ -232,7 +239,7 @@ jobs:
       export_susfs_patches: ${{ inputs.export_susfs_patches }}
       ksu_mode: ${{ inputs.ksu_mode }}
       droidspaces: ${{ inputs.droidspaces }}
-      artifact_upload_mode: "上传全部"
+      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
       called_from_main: true
 
@@ -254,7 +261,7 @@ jobs:
       export_susfs_patches: ${{ inputs.export_susfs_patches }}
       ksu_mode: ${{ inputs.ksu_mode }}
       droidspaces: ${{ inputs.droidspaces }}
-      artifact_upload_mode: "上传全部"
+      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
       called_from_main: true
 

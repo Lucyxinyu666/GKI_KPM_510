@@ -133,7 +133,7 @@ on:
       artifact_upload_mode:
         required: false
         type: string
-        default: "上传全部"
+        default: "仅上传 AnyKernel3.zip"
       droidspaces_ntsync:
         required: false
         type: boolean
@@ -259,7 +259,7 @@ jobs:
           AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool
           MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py
           UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py
-          BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem
+          BOOT_SIGN_KEY_PATH=$RUNNER_TEMP/gki-boot-signing-key.pem
           EOF
 
           mkdir -p "$GITHUB_WORKSPACE/git-repo"
@@ -321,22 +321,13 @@ jobs:
         id: cache-toolchain
         uses: actions/cache@v5
         with:
-          path: |
-            kernel-build-tools
-            mkbootimg
-          key: toolchain-${{ runner.os }}-v1
+          path: kernel-build-tools
+          key: toolchain-${{ runner.os }}-v2
 
       - name: 下载工具链
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
-          AOSP_MIRROR=https://android.googlesource.com
-          BRANCH=main-kernel-build-2024
-          git clone $AOSP_MIRROR/kernel/prebuilts/build-tools -b $BRANCH --depth 1 kernel-build-tools
-          git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg
-
-      - name: 生成签名密钥
-        run: |
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 > $BOOT_SIGN_KEY_PATH
+          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-build-2024 --depth 1 kernel-build-tools
 
       - name: 配置 Git
         run: |
@@ -1912,6 +1903,18 @@ jobs:
             fi
           fi
 
+      - name: 准备 Bazel 配置片段
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          if [ -f build/build.sh ]; then
+            exit 0
+          fi
+          # 在重试动作外生成一次；恢复 defconfig 后，重试仍使用同一份片段。
+          changes=$(diff "$DEFCONFIG.orig" "$DEFCONFIG") || [ "$?" -eq 1 ]
+          printf '%s\n' "$changes" | sed -n 's/^>[[:blank:]]*//p' > common/arch/arm64/configs/ksu.fragment
+          cp "$DEFCONFIG.orig" "$DEFCONFIG"
+
       - name: 编译内核
         id: compile_kernel
         uses: nick-fields/retry@v4
@@ -1953,22 +1956,19 @@ jobs:
                 LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
                 strings "out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" | grep 'Linux version'
               else
-                # 提取 gki_defconfig 修改到 fragment，避免 bazel trim 检查失败
                 FRAG="common/arch/arm64/configs/ksu.fragment"
-                diff "$DEFCONFIG.orig" "$DEFCONFIG" | grep '^>' | sed 's/^> //; s/^[[:space:]]*//' > "$FRAG" || true
-                cp "$DEFCONFIG.orig" "$DEFCONFIG"
                 echo "=== KSU Fragment 内容 ==="
                 cat "$FRAG"
                 echo "========================="
-                FRAG_FLAG=""
+                FRAG_FLAGS=()
                 if [ -s "$FRAG" ]; then
-                  FRAG_FLAG="--defconfig_fragment=//common:arch/arm64/configs/ksu.fragment"
+                  FRAG_FLAGS+=("--defconfig_fragment=//common:arch/arm64/configs/ksu.fragment")
                 fi
                 LTO_FLAG="--lto=thin"
                 if [ "${{ inputs.kernel_version }}" = "6.12" ]; then
                   LTO_FLAG="--lto=none"
                 fi
-                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast $LTO_FLAG $FRAG_FLAG //common:kernel_aarch64_dist || exit 1
+                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast "$LTO_FLAG" "${FRAG_FLAGS[@]}" //common:kernel_aarch64_dist || exit 1
                 strings ./bazel-bin/common/kernel_aarch64/Image | grep 'Linux version'
               fi
 
@@ -2024,7 +2024,7 @@ jobs:
 
       - name: 定位待打包的 ARM64 Image
         run: |
-          if [ "${{ inputs.android_version }}" == "android12" ] || [ "${{ inputs.android_version }}" == "android13" ]; then
+          if [ -f "$KERNEL_ROOT/build/build.sh" ]; then
             IMAGE_DIR="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
           else
             IMAGE_DIR="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
@@ -2060,64 +2060,85 @@ jobs:
           mv -f "$patched" Image
           printf 'VERIFIED_KPM_SHA256=%s\n' "$(sha256sum Image | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
 
-          # 用打过补丁的 Image 重建 Image.lz4，保证 lz4 镜像与 boot.img 内核一致
-          if ! command -v lz4 >/dev/null 2>&1; then
-            sudo apt-get update -qq >/dev/null 2>&1 || true
-            sudo apt-get install -y -qq lz4 >/dev/null 2>&1 || true
-          fi
-          if command -v lz4 >/dev/null 2>&1; then
-            # GKI 的 Image.lz4 使用 legacy 帧格式（lz4 -l），bootloader 才能解压
-            lz4 -l -12 --favor-decSpeed -f Image Image.lz4
-            if lz4 -d -c Image.lz4 | cmp - Image >/dev/null 2>&1; then
-              echo "OK: Image.lz4 已由打过补丁的 Image 重建，解压校验一致"
-            else
-              echo "::error::Image.lz4 重建后解压校验失败"
-              exit 1
-            fi
-          else
-            echo "::warning::环境缺少 lz4，删除未含 KPM 的 Image.lz4，并跳过 lz4 镜像构建"
-            rm -f Image.lz4
-            echo "SKIP_LZ4_IMAGE=true" >> $GITHUB_ENV
-          fi
-
-      - name: 准备 Boot 镜像
+      - name: 准备刷机包内核
         run: |
           set -euo pipefail
-          mkdir -p bootimgs
           cp "$IMAGE_DIR/Image" ./Image
           python3 scripts/verify_arm64_image.py ./Image
           if [ -n "${VERIFIED_KPM_SHA256:-}" ]; then
             printf '%s  Image\n' "$VERIFIED_KPM_SHA256" | sha256sum -c -
           fi
-          cp ./Image ./bootimgs/
-          # Image.lz4 可能不存在（KPM 步骤检测到缺少 lz4 时会删掉它，避免发出未含 KPM 的镜像）
-          if [ -f "$IMAGE_DIR/Image.lz4" ]; then
-            cp "$IMAGE_DIR/Image.lz4" ./bootimgs/
-            cp "$IMAGE_DIR/Image.lz4" ./
-          else
-            echo "::warning::没有可用的 Image.lz4，将跳过 lz4 镜像构建"
-          fi
-          gzip -n -f -9 -c ./Image > ./Image.gz
 
       - name: 校验内核身份 (SukiSU builtin + SUSFS)
         if: inputs.ksu_variant == 'SukiSU' && inputs.ksu_mode != '禁用KSU' && inputs.enable_susfs
         run: python3 scripts/verify_arm64_image.py ./Image --susfs
 
       - name: 创建 AnyKernel3 压缩包
-        if: inputs.artifact_upload_mode == '上传全部'
-        run: |
-          cd "$ANYKERNEL3"
-          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
-          mv ../Image ./Image
-          zip -r "../$ZIP_NAME" ./*
-
-      - name: 准备 AnyKernel3 目录
-        if: inputs.artifact_upload_mode != '上传全部'
+        env:
+          AK3_ZIP: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip
         run: |
           mv ./Image "$ANYKERNEL3/Image"
+          cd "$ANYKERNEL3"
+          zip -r "../$AK3_ZIP" ./*
+          unzip -t "../$AK3_ZIP"
+
+      # 先独立上传刷机包，后续可选的 Boot 镜像构建失败不会导致 AK3 丢失。
+      - name: 上传 AnyKernel3 刷入包
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-AnyKernel3
+          path: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: 下载 Boot 镜像工具并生成签名密钥
+        if: inputs.artifact_upload_mode == '上传全部'
+        run: |
+          git clone https://android.googlesource.com/platform/system/tools/mkbootimg -b main-kernel-build-2024 --depth 1 mkbootimg
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 > "$BOOT_SIGN_KEY_PATH"
+
+      - name: 准备可选 Boot 镜像的内核
+        if: inputs.artifact_upload_mode == '上传全部'
+        run: |
+          set -euo pipefail
+          mkdir -p bootimgs
+          cp "$ANYKERNEL3/Image" bootimgs/Image
+          cd bootimgs
+          gzip -n -9 -c Image > Image.gz
+
+          if [ -z "${VERIFIED_KPM_SHA256:-}" ]; then
+            # 无 KPM 时可直接使用编译产出的压缩镜像。
+            if [ -f "$IMAGE_DIR/Image.lz4" ]; then
+              cp "$IMAGE_DIR/Image.lz4" .
+            fi
+            exit 0
+          fi
+
+          # 有 KPM 时不能使用编译产出的未补丁 Image.lz4。
+          if ! command -v lz4 >/dev/null 2>&1; then
+            sudo apt-get update -qq >/dev/null 2>&1 || true
+            sudo apt-get install -y -qq lz4 >/dev/null 2>&1 || true
+          fi
+          if ! command -v lz4 >/dev/null 2>&1; then
+            echo '::warning::缺少 lz4，跳过 boot-lz4.img'
+            exit 0
+          fi
+          # 各 ACK 分支的 ARM64 Image.lz4 使用 cmd_lz4，但不一定有长度尾标。
+          rule=$(sed -n '/^cmd_lz4[[:space:]]*=/{p; :cont; /\\$/{n; p; b cont;};}' "$KERNEL_ROOT/common/scripts/Makefile.lib")
+          case "$rule" in
+            *'$(LZ4) -l -12 --favor-decSpeed'*) lz4_flags=(-l -12 --favor-decSpeed) ;;
+            *'$(LZ4) -l -9'*) lz4_flags=(-l -9) ;;
+            *) echo '::warning::无法识别当前内核的 LZ4 规则，跳过 boot-lz4.img'; exit 0 ;;
+          esac
+          lz4 "${lz4_flags[@]}" -c Image > Image.lz4
+          lz4 -d -c Image.lz4 | cmp - Image
+          if [[ "$rule" == *'$(size_append)'* ]]; then
+            # size_append：压缩流后附 4 字节原始长度（小端）。
+            python3 -c 'import struct, sys; from pathlib import Path; sys.stdout.buffer.write(struct.pack("<I", Path("Image").stat().st_size))' >> Image.lz4
+          fi
 
       - name: 构建 Boot 镜像 (Android 12)
-        if: inputs.android_version == 'android12'
+        if: inputs.artifact_upload_mode == '上传全部' && inputs.android_version == 'android12'
         working-directory: bootimgs
         run: |
           GKI_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip
@@ -2132,8 +2153,6 @@ jobs:
 
           unzip gki-kernel.zip && rm gki-kernel.zip
           $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
-
-          gzip -n -k -f -9 ./Image > ./Image.gz
 
           $MKBOOTIMG --header_version 4 --kernel Image --output boot.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
           $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
@@ -2152,11 +2171,9 @@ jobs:
           fi
 
       - name: 构建 Boot 镜像 (Android 13+)
-        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
+        if: inputs.artifact_upload_mode == '上传全部' && (inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16')
         working-directory: bootimgs
         run: |
-          gzip -n -k -f -9 ./Image > ./Image.gz
-
           $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
           $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
           cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot.img
@@ -2221,22 +2238,13 @@ jobs:
           if-no-files-found: warn
           compression-level: 9
 
-      - name: 上传 AnyKernel3 刷入包
-        if: inputs.artifact_upload_mode != '上传全部'
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-AnyKernel3
-          path: AnyKernel3/*
-          compression-level: 9
-
-      - name: 上传全部构建产物
+      - name: 上传可选 Boot 镜像
         if: inputs.artifact_upload_mode == '上传全部'
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}
-          path: |
-            *AnyKernel3.zip
-            *.img
+          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-Boot
+          path: '*-boot*.img'
+          if-no-files-found: error
           compression-level: 9
 
       - name: 上传补丁冲突文件
