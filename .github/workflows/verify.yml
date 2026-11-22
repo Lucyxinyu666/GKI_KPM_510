@@ -1,0 +1,28 @@
+name: Verify new kernel
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  v:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify Image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VB64: aW1wb3J0IHN5cywgemxpYgpkYXRhPW9wZW4oc3lzLmFyZ3ZbMV0sJ3JiJykucmVhZCgpCmk9ZGF0YS5maW5kKGInSUtDRkdfU1QnKQppZiBpPDA6CiAgICBwcmludCgiTk8gSUtDRkciKTsgc3lzLmV4aXQoKQpjZmc9emxpYi5kZWNvbXByZXNzb2JqKDE2K3psaWIuTUFYX1dCSVRTKS5kZWNvbXByZXNzKGRhdGFbaSs4Ol0pLmRlY29kZSgndXRmLTgnLCdpZ25vcmUnKQpmb3IgayBpbiBbJ0NPTkZJR19LU1VfU1VTRlMnLCdDT05GSUdfS1BNJywnQ09ORklHX0tTVV9NQU5VQUxfU1UnLCdDT05GSUdfS1NVX1NVU0ZTX1NVU19QQVRIJywnQ09ORklHX0tTVV9TVVNGU19TVVNfTU9VTlQnLCdDT05GSUdfS1NVX1NVU0ZTX1NQT09GX1VOQU1FJywnQ09ORklHX0tTVV9TVVNGU19ISURFX0tTVV9TVVNGU19TWU1CT0xTJ106CiAgICBmb3IgbGluZSBpbiBjZmcuc3BsaXRsaW5lcygpOgogICAgICAgIGlmIGxpbmUuc3RhcnRzd2l0aChrKyc9Jyk6CiAgICAgICAgICAgIHByaW50KGxpbmUpCiAgICAgICAgICAgIGJyZWFrCg==
+        run: |
+          set -e
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/14760546541/zip" -o ak3.zip
+          unzip -o -q ak3.zip -d d
+          IMG=$(find d -type f -name Image | head -1)
+          echo "IMG=$IMG size=$(stat -c%s "$IMG")"
+          echo "=====LINUX VERSION====="
+          strings -a "$IMG" | grep -m1 '^Linux version [0-9]'
+          echo "=====IKCFG CONFIG====="
+          echo "$VB64" | base64 -d > /tmp/vcfg.py
+          python3 /tmp/vcfg.py "$IMG"
+          echo "=====FEATURE STRINGS====="
+          strings -a "$IMG" | grep -iE 'sukisu|nova|susfs|dynamic_manager' | sort -u | head -20
