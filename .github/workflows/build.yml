@@ -2022,56 +2022,43 @@ jobs:
           retention-days: 7
           compression-level: 9
 
-      # ==================== KPM：CONFIG_KPM + KernelPatch 宿主注入 ====================
-      # 修改说明（本 fork）：
-      #   1. patch_linux 只产出 Image(oImage)，不会重建 Image.lz4；而 boot-lz4.img 用的是
-      #      Image.lz4。若不重建，刷 lz4 镜像的用户会拿到「有 CONFIG_KPM、没有 KernelPatch
-      #      宿主」的内核。故此处补上 Image.lz4 的重建与解压自检。
-      #   2. 产物目录不再按 android/kernel 组合猜（原逻辑在 android12/13 + 6.6 时
-      #      TARGET_PATH 为空，cp 会落到根目录），改为按「目录下是否存在 Image」探测。
-      #   3. 支持集合与 CONFIG_KPM 注入保持一致：SukiSU / BakaSU / Next。
-      # 只有在「KSU 本体存在」且「会写入 CONFIG_KPM」时才注入宿主，
-      # 否则会产出「有宿主、无 CONFIG_KPM」或反之的半成品内核。
+      - name: 定位待打包的 ARM64 Image
+        run: |
+          if [ "${{ inputs.android_version }}" == "android12" ] || [ "${{ inputs.android_version }}" == "android13" ]; then
+            IMAGE_DIR="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
+          else
+            IMAGE_DIR="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
+          fi
+          python3 scripts/verify_arm64_image.py "$IMAGE_DIR/Image"
+          printf 'IMAGE_DIR=%s\n' "$IMAGE_DIR" >> "$GITHUB_ENV"
+
+      # KPM：直接传入独立的 kpimg，避免 patch_linux 编入的 1 字节占位资源。
       - name: 应用 KPM 补丁 (SukiSU/BakaSU/Next)
         if: ${{ inputs.ksu_mode != '禁用KSU' && (startsWith(inputs.use_kpm, 'enabled') || startsWith(inputs.use_kpm, 'patched')) && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU' || inputs.ksu_variant == 'Next') }}
         run: |
           set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -f "$work/kptools" "$work/kpimg"; rmdir "$work"' EXIT
+          base="https://raw.githubusercontent.com/SukiSU-Nova/SukiSU_patch/4ee085a39e3c95e44c9cac7af040e83bf926e6fa/kpm"
+          curl -fsSL --retry 3 "$base/kptools-linux" -o "$work/kptools"
+          curl -fsSL --retry 3 "$base/kpimg" -o "$work/kpimg"
+          (
+            cd "$work"
+            sha256sum -c <<'SHA256'
+          a6b912ca964d35427d7fbcd87273abac604970e9746fa0613362be971f07259d  kptools
+          14fc6564fa092afe4a2293268cd061da64a20f61dc91396a404daf13d053f5ca  kpimg
+          SHA256
+          )
+          chmod u+x "$work/kptools"
 
-          PATCH_BIN="${SUKISU_PATCHES}/kpm/patch_linux"
-          if [ ! -f "$PATCH_BIN" ]; then
-            echo "::error::未找到 KPM 补丁程序: $PATCH_BIN"
-            exit 1
-          fi
-
-          TARGET_PATH=""
-          for d in \
-            "$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist" \
-            "$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}" \
-            "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"; do
-            if [ -f "$d/Image" ]; then
-              TARGET_PATH="$d"
-              break
-            fi
-          done
-          if [ -z "$TARGET_PATH" ]; then
-            echo "::error::未找到编译产物 Image，无法注入 KernelPatch 宿主"
-            exit 1
-          fi
-          echo "KPM 目标目录: $TARGET_PATH"
-
-          cd "$TARGET_PATH"
-          rm -rf ./patch
-          cp -f "$PATCH_BIN" ./patch
-          chmod 777 ./patch
-          ./patch
-
-          if [ ! -f oImage ]; then
-            echo "::error::patch_linux 未产出 oImage，KernelPatch 宿主注入失败"
-            exit 1
-          fi
-          rm -f Image
-          mv oImage Image
-          echo "OK: Image 已注入 KernelPatch 宿主"
+          cd "$IMAGE_DIR"
+          patched="$(mktemp ./Image.kpm.XXXXXXXX)"
+          trap 'rm -f "$patched" "$work/kptools" "$work/kpimg"; rmdir "$work"' EXIT
+          "$work/kptools" -p -i Image -k "$work/kpimg" -o "$patched"
+          python3 "$GITHUB_WORKSPACE/scripts/verify_arm64_image.py" "$patched" --kpm Image "$work/kpimg"
+          chmod --reference=Image "$patched"
+          mv -f "$patched" Image
+          printf 'VERIFIED_KPM_SHA256=%s\n' "$(sha256sum Image | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
 
           # 用打过补丁的 Image 重建 Image.lz4，保证 lz4 镜像与 boot.img 内核一致
           if ! command -v lz4 >/dev/null 2>&1; then
@@ -2095,24 +2082,26 @@ jobs:
 
       - name: 准备 Boot 镜像
         run: |
+          set -euo pipefail
           mkdir -p bootimgs
-
-          if [ "${{ inputs.android_version }}" == "android12" ] || [ "${{ inputs.android_version }}" == "android13" ]; then
-            SRC_DIR="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
-          else
-            SRC_DIR="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
+          cp "$IMAGE_DIR/Image" ./Image
+          python3 scripts/verify_arm64_image.py ./Image
+          if [ -n "${VERIFIED_KPM_SHA256:-}" ]; then
+            printf '%s  Image\n' "$VERIFIED_KPM_SHA256" | sha256sum -c -
           fi
-
-          cp "$SRC_DIR/Image" ./bootimgs/
-          cp "$SRC_DIR/Image" ./
+          cp ./Image ./bootimgs/
           # Image.lz4 可能不存在（KPM 步骤检测到缺少 lz4 时会删掉它，避免发出未含 KPM 的镜像）
-          if [ -f "$SRC_DIR/Image.lz4" ]; then
-            cp "$SRC_DIR/Image.lz4" ./bootimgs/
-            cp "$SRC_DIR/Image.lz4" ./
+          if [ -f "$IMAGE_DIR/Image.lz4" ]; then
+            cp "$IMAGE_DIR/Image.lz4" ./bootimgs/
+            cp "$IMAGE_DIR/Image.lz4" ./
           else
             echo "::warning::没有可用的 Image.lz4，将跳过 lz4 镜像构建"
           fi
-          gzip -n -k -f -9 ./Image > ./Image.gz
+          gzip -n -f -9 -c ./Image > ./Image.gz
+
+      - name: 校验内核身份 (SukiSU builtin + SUSFS)
+        if: inputs.ksu_variant == 'SukiSU' && inputs.ksu_mode != '禁用KSU' && inputs.enable_susfs
+        run: python3 scripts/verify_arm64_image.py ./Image --susfs
 
       - name: 创建 AnyKernel3 压缩包
         if: inputs.artifact_upload_mode == '上传全部'
@@ -2121,20 +2110,6 @@ jobs:
           ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
           mv ../Image ./Image
           zip -r "../$ZIP_NAME" ./*
-
-      # ===== bootloop 防护：编译后从 Image 提取 config 校验 SukiSU+SUSFS 身份 =====
-      - name: 校验内核身份 (SukiSU builtin + SUSFS)
-        if: inputs.ksu_variant == 'SukiSU' && inputs.ksu_mode != '禁用KSU'
-        working-directory: ${{ env.KERNEL_ROOT }}
-        env:
-          VERIFY_B64: aW1wb3J0IHpsaWIsIHN5cywgcmUKZGF0YSA9IG9wZW4oIkltYWdlIiwicmIiKS5yZWFkKCkKaSA9IGRhdGEuZmluZChiJ0lLQ0ZHX1NUJykKaWYgaSA8IDA6CiAgICBwcmludCgiOjplcnJvcjo6SW1hZ2Ug5YaF5pyq5om+5YiwIElLQ0ZHIGNvbmZpZ++8jOaXoOazleagoemqjCIpOyBzeXMuZXhpdCgxKQpjZmcgPSB6bGliLmRlY29tcHJlc3NvYmooMTYremxpYi5NQVhfV0JJVFMpLmRlY29tcHJlc3MoZGF0YVtpKzg6XSkuZGVjb2RlKCd1dGYtOCcsJ2lnbm9yZScpCmVycm9ycyA9IFtdCmlmIG5vdCByZS5zZWFyY2gocideQ09ORklHX0tTVV9TVVNGUz15JCcsIGNmZywgcmUuTSk6CiAgICBlcnJvcnMuYXBwZW5kKCLnvLrlsJEgQ09ORklHX0tTVV9TVVNGUz15IOKAlOKAlCDkuI3mmK8gYnVpbHRpbu+8iFNVU0ZT77yJ5YaF5qC4IikKaWYgcmUuc2VhcmNoKHInXkNPTkZJR19LU1VfTUFOVUFMX1NVPXkkJywgY2ZnLCByZS5NKToKICAgIGVycm9ycy5hcHBlbmQoIuWHuueOsCBDT05GSUdfS1NVX01BTlVBTF9TVT15IOKAlOKAlCDnlpHkvLzljp/niYggS2VybmVsU1XvvIzpnZ4gU3VraVNVIGJ1aWx0aW4iKQppZiBub3QgcmUuc2VhcmNoKHInXkNPTkZJR19LUE09eSQnLCBjZmcsIHJlLk0pOgogICAgZXJyb3JzLmFwcGVuZCgi57y65bCRIENPTkZJR19LUE09eSDigJTigJQg5pegIEtQTSDmlK/mjIEiKQpmb3IgayBpbiBbIkNPTkZJR19LU1VfU1VTRlNfU1VTX1BBVEgiLCJDT05GSUdfS1NVX1NVU0ZTX1NVU19NT1VOVCIsIkNPTkZJR19LU1VfU1VTRlNfU1BPT0ZfVU5BTUUiXToKICAgIGlmIG5vdCByZS5zZWFyY2gocideJXM9eSQnJWssIGNmZywgcmUuTSk6CiAgICAgICAgZXJyb3JzLmFwcGVuZCgi57y65bCRICVzPXkiJWspCmlmIGVycm9yczoKICAgIGZvciBlIGluIGVycm9yczoKICAgICAgICBwcmludCgiOjplcnJvcjo6IitlLCBmaWxlPXN5cy5zdGRlcnIpCiAgICBzeXMuZXhpdCgxKQpwcmludCgiT0s6IOWGheaguOi6q+S7veagoemqjOmAmui/hyDigJTigJQgU3VraVNVIGJ1aWx0aW4gKyBTVVNGUyArIEtQTSDpvZDlpIciKQo=
-        run: |
-          set -e
-          [ -f ./Image ] || { echo "::error::未找到编译产物 Image" >&2; exit 1; }
-          echo "$VERIFY_B64" | base64 -d > /tmp/verify_kernel.py
-          python3 /tmp/verify_kernel.py
-          echo "=== 版本串 ==="
-          strings -a ./Image | grep -m1 '^Linux version [0-9]'
 
       - name: 准备 AnyKernel3 目录
         if: inputs.artifact_upload_mode != '上传全部'
