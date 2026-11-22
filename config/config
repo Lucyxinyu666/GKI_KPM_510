@@ -2,6 +2,8 @@
 #
 # 本文件用于把 SUSFS / SukiSU 固定到指定提交，避免上游变动导致构建结果漂移。
 # 修改者：Eternal-Dash（2026-10）—— 补充生效条件说明与钉死原因，逻辑未变。
+# 2026-11-22 升级：SukiSU 升到 Nova v3.0.0（4bec532）、SUSFS 升到 11-15（784ac9e），
+#   两者同代；已验证 builtin 最新代码含 SUSFS 依赖的 5 个新符号，旧 undefined symbol 风险消除。
 #
 # 生效条件（重要）：
 #   · custom=true 且变体为 SukiSU 才会读取下面的 sukisu 项
@@ -41,7 +43,7 @@ custom=true
 #   降级后出现 susfs_add_sus_map / CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING /
 #   susfs_get_enabled_features 签名不匹配等错误。
 #   故 SUSFS 与 SukiSU 必须同代；补丁上下文问题改由 apply.sh 的 .rej 兜底处理。
-gki-android12-5.10=31eb14add587b0a089dfe1819f92cc94920e141e
+gki-android12-5.10=784ac9e6fd49bb02499b5b60c57ccc9d0c680204
 gki-android13-5.15=a2dff232d075e033d43999a71deddaaa261aaf2e
 gki-android14-6.1=2385dab487c3abb8c4a2990ea5c852f55fb47dc8
 gki-android15-6.6=ebf876ee4ec4761989b30bc9d545d8e2b85c2270
@@ -50,12 +52,12 @@ gki-android16-6.12=
 # ==================== SukiSU 的 commit hash ====================
 # 仅当 custom=true 且使用 SukiSU 变体、且启用 SUSFS 时生效
 #
-# 当前钉的是 builtin 分支的 v4.2.1 版本提交：
+# 当前钉的是 builtin 分支的 Nova v3.0.0 版本提交（4bec532，2026-11-15）：
 #   · 只有 builtin 分支内置 SUSFS（main 分支不含 SUSFS，故不要改成 main 的提交）
-#   · 其后的提交引入了动态管理器，而该处存在上游编译错误，暂不跟进
+#   · 已从 v4.2.1 升到 Nova 3.0.0，配套 SUSFS 11-15（784ac9e），两者必须同代
 #
 # 换提交前请先确认：
 #   1) 仍属于 builtin 分支
 #   2) kernel/include/uapi/supercall.h 仍存在（否则 UAPI 修补会跳过、可能与管理器错配）
 #   3) kernel/feature/selinux_hide.c 的写法仍与修补正则匹配（看构建日志是否输出“已消除外部符号引用”）
-sukisu=1ba8414eab9797e61696560699b1f63850d3861a
+sukisu=4bec532dd447e2852aa8932afa768255350c103a
