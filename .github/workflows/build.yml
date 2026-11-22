@@ -666,8 +666,37 @@ jobs:
               curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/dev/kernel/setup.sh" | bash -s dev_susfs
               ;;
             "SukiSU")
-              echo "添加 ${{ inputs.ksu_variant }}..."
-              curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash $BRANCH
+              echo "添加 ${{ inputs.ksu_variant }}（显式 clone 官方 builtin 分支 + 钉死 commit）..."
+              # 【修复 bootloop 根因】
+              # 官方 setup.sh 从 git.zako.shirkneko.top:20004/shirkneko/SukiSU 克隆，
+              # 该镜像已失效且不含 config 钉住的 commit；且其
+              #   git checkout "$1" && echo OK || echo "Checkout default branch"
+              # 会静默吞掉 checkout 失败，回退到 main 默认分支，导致编出原版 KSU（无 SUSFS）。
+              # 这里改为直接从 GitHub 官方仓库 clone builtin 分支，显式 checkout 目标 commit，
+              # 并断言 HEAD，确保真正编到 SukiSU-Nova builtin + SUSFS 源码。
+              set -e
+              GKI_ROOT="$(pwd)"
+              KSU_COMMIT="$(grep '^sukisu=' "$GITHUB_WORKSPACE/config/config" | cut -d'=' -f2- | tr -d ' \r\t')"
+              [ -n "$KSU_COMMIT" ] || { echo "::error::config/config 未配置 sukisu commit" >&2; exit 1; }
+              rm -rf KernelSU
+              git clone --branch builtin --single-branch https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+              git -C KernelSU checkout "$KSU_COMMIT"
+              ACTUAL_HEAD="$(git -C KernelSU rev-parse HEAD)"
+              echo "SukiSU 目标 commit: $KSU_COMMIT"
+              echo "SukiSU 实际 HEAD  : $ACTUAL_HEAD"
+              if [ "$ACTUAL_HEAD" != "$KSU_COMMIT" ]; then
+                echo "::error::SukiSU checkout 未生效！期望 $KSU_COMMIT，实际 $ACTUAL_HEAD" >&2
+                exit 1
+              fi
+              echo "OK: SukiSU 已切到 builtin 分支钉死 commit"
+              # 复刻 setup.sh 的 drivers 接入（软链 + Makefile + Kconfig）
+              DRIVER_DIR="$GKI_ROOT/drivers"
+              [ -d "$DRIVER_DIR" ] || DRIVER_DIR="$GKI_ROOT/common/drivers"
+              [ -d "$DRIVER_DIR" ] || { echo "::error::未找到 drivers 目录" >&2; exit 1; }
+              ln -sf "$(realpath --relative-to="$DRIVER_DIR" "$GKI_ROOT/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
+              grep -q "kernelsu" "$DRIVER_DIR/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "$DRIVER_DIR/Makefile"
+              grep -q "drivers/kernelsu/Kconfig" "$DRIVER_DIR/Kconfig" || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" "$DRIVER_DIR/Kconfig"
+              echo "OK: KernelSU drivers 接入完成"
               ;;
             "BakaSU")
               echo "添加 BakaSU..."
@@ -2050,6 +2079,20 @@ jobs:
           ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
           mv ../Image ./Image
           zip -r "../$ZIP_NAME" ./*
+
+      # ===== bootloop 防护：编译后从 Image 提取 config 校验 SukiSU+SUSFS 身份 =====
+      - name: 校验内核身份 (SukiSU builtin + SUSFS)
+        if: inputs.ksu_variant == 'SukiSU' && inputs.enable_susfs == 'true' && inputs.ksu_mode != '禁用KSU'
+        working-directory: ${{ env.KERNEL_ROOT }}
+        env:
+          VERIFY_B64: aW1wb3J0IHpsaWIsIHN5cywgcmUKZGF0YSA9IG9wZW4oIkltYWdlIiwicmIiKS5yZWFkKCkKaSA9IGRhdGEuZmluZChiJ0lLQ0ZHX1NUJykKaWYgaSA8IDA6CiAgICBwcmludCgiOjplcnJvcjo6SW1hZ2Ug5YaF5pyq5om+5YiwIElLQ0ZHIGNvbmZpZ++8jOaXoOazleagoemqjCIpOyBzeXMuZXhpdCgxKQpjZmcgPSB6bGliLmRlY29tcHJlc3NvYmooMTYremxpYi5NQVhfV0JJVFMpLmRlY29tcHJlc3MoZGF0YVtpKzg6XSkuZGVjb2RlKCd1dGYtOCcsJ2lnbm9yZScpCmVycm9ycyA9IFtdCmlmIG5vdCByZS5zZWFyY2gocideQ09ORklHX0tTVV9TVVNGUz15JCcsIGNmZywgcmUuTSk6CiAgICBlcnJvcnMuYXBwZW5kKCLnvLrlsJEgQ09ORklHX0tTVV9TVVNGUz15IOKAlOKAlCDkuI3mmK8gYnVpbHRpbu+8iFNVU0ZT77yJ5YaF5qC4IikKaWYgcmUuc2VhcmNoKHInXkNPTkZJR19LU1VfTUFOVUFMX1NVPXkkJywgY2ZnLCByZS5NKToKICAgIGVycm9ycy5hcHBlbmQoIuWHuueOsCBDT05GSUdfS1NVX01BTlVBTF9TVT15IOKAlOKAlCDnlpHkvLzljp/niYggS2VybmVsU1XvvIzpnZ4gU3VraVNVIGJ1aWx0aW4iKQppZiBub3QgcmUuc2VhcmNoKHInXkNPTkZJR19LUE09eSQnLCBjZmcsIHJlLk0pOgogICAgZXJyb3JzLmFwcGVuZCgi57y65bCRIENPTkZJR19LUE09eSDigJTigJQg5pegIEtQTSDmlK/mjIEiKQpmb3IgayBpbiBbIkNPTkZJR19LU1VfU1VTRlNfU1VTX1BBVEgiLCJDT05GSUdfS1NVX1NVU0ZTX1NVU19NT1VOVCIsIkNPTkZJR19LU1VfU1VTRlNfU1BPT0ZfVU5BTUUiXToKICAgIGlmIG5vdCByZS5zZWFyY2gocideJXM9eSQnJWssIGNmZywgcmUuTSk6CiAgICAgICAgZXJyb3JzLmFwcGVuZCgi57y65bCRICVzPXkiJWspCmlmIGVycm9yczoKICAgIGZvciBlIGluIGVycm9yczoKICAgICAgICBwcmludCgiOjplcnJvcjo6IitlLCBmaWxlPXN5cy5zdGRlcnIpCiAgICBzeXMuZXhpdCgxKQpwcmludCgiT0s6IOWGheaguOi6q+S7veagoemqjOmAmui/hyDigJTigJQgU3VraVNVIGJ1aWx0aW4gKyBTVVNGUyArIEtQTSDpvZDlpIciKQo=
+        run: |
+          set -e
+          [ -f ./Image ] || { echo "::error::未找到编译产物 Image" >&2; exit 1; }
+          echo "$VERIFY_B64" | base64 -d > /tmp/verify_kernel.py
+          python3 /tmp/verify_kernel.py
+          echo "=== 版本串 ==="
+          strings -a ./Image | grep -m1 '^Linux version [0-9]'
 
       - name: 准备 AnyKernel3 目录
         if: inputs.artifact_upload_mode != '上传全部'
