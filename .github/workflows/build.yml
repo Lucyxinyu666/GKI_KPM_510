@@ -784,28 +784,63 @@ jobs:
         working-directory: ${{ env.KERNEL_ROOT }}/KernelSU
         run: |
           set -e
-          KBUILD_FILE="./kernel/Kbuild"
           CUSTOM_PKG="com.mobile.tools.manager"
           CUSTOM_SIZE="0x339"
           CUSTOM_HASH="e5cb7fac7b03f28c8dc3fd1f682cd806378a52a26dd79434c79ea2de1b8ac13c"
 
-          if [ ! -f "$KBUILD_FILE" ]; then
-            echo "::error::未找到 $KBUILD_FILE，无法定制管理器信息" >&2
+          # 2026-11-22 适配 Nova 3.0.0：
+          #   旧版(v4.2.1)：包名/签名是 kernel/Kbuild 里 KSU_PACKAGE_NAME/EXPECTED_SIZE/EXPECTED_HASH
+          #   新版(Nova 3.0.0)：Kbuild→Makefile，且签名改为 apk_sign.c 的 apk_sign_keys[] 数组
+          # 自动识别两种结构，分别处理，保证定制 APK 能拿到 root。
+
+          # ---- 1) 包名：Kbuild(旧) 或 Makefile(新) ----
+          MKFILE=""
+          for f in ./kernel/Kbuild ./kernel/Makefile; do
+            [ -f "$f" ] && MKFILE="$f" && break
+          done
+          if [ -z "$MKFILE" ]; then
+            echo "::error::未找到 kernel/Kbuild 或 kernel/Makefile，无法定制包名" >&2
             exit 1
           fi
+          echo "包名字段文件: $MKFILE"
+          if grep -q 'KSU_PACKAGE_NAME' "$MKFILE"; then
+            sed -i -E "s|^KSU_PACKAGE_NAME \?= .*|KSU_PACKAGE_NAME ?= $CUSTOM_PKG|" "$MKFILE"
+          else
+            echo "KSU_PACKAGE_NAME ?= $CUSTOM_PKG" >> "$MKFILE"
+          fi
+          grep -q "KSU_PACKAGE_NAME ?= $CUSTOM_PKG" "$MKFILE" || {
+            echo "::error::包名未写入 $MKFILE" >&2; exit 1; }
 
-          # Kbuild 里这三个变量用 ?= 定义；在 setup.sh 之后直接改默认值即可生效。
-          sed -i -E "s|^KSU_PACKAGE_NAME \?= .*|KSU_PACKAGE_NAME ?= $CUSTOM_PKG|" "$KBUILD_FILE"
-          sed -i -E "s|^KSU_EXPECTED_SIZE \?= .*|KSU_EXPECTED_SIZE ?= $CUSTOM_SIZE|" "$KBUILD_FILE"
-          sed -i -E "s|^KSU_EXPECTED_HASH \?= .*|KSU_EXPECTED_HASH ?= $CUSTOM_HASH|" "$KBUILD_FILE"
+          # ---- 2) 签名：旧版 EXPECTED_* 变量 / 新版 apk_sign_keys[] 数组 ----
+          if grep -q 'KSU_EXPECTED_SIZE' "$MKFILE"; then
+            # 旧版结构
+            sed -i -E "s|^KSU_EXPECTED_SIZE \?= .*|KSU_EXPECTED_SIZE ?= $CUSTOM_SIZE|" "$MKFILE"
+            sed -i -E "s|^KSU_EXPECTED_HASH \?= .*|KSU_EXPECTED_HASH ?= $CUSTOM_HASH|" "$MKFILE"
+            grep -q "KSU_EXPECTED_SIZE ?= $CUSTOM_SIZE" "$MKFILE" && \
+            grep -q "KSU_EXPECTED_HASH ?= $CUSTOM_HASH" "$MKFILE" || {
+              echo "::error::旧版签名变量未写入" >&2; exit 1; }
+            echo "OK: 旧版 EXPECTED_SIZE/HASH 签名已写入"
+          else
+            # 新版结构：往 apk_sign.c 的 apk_sign_keys[] 插入定制签名
+            SIGN_FILE="./kernel/manager/apk_sign.c"
+            if [ ! -f "$SIGN_FILE" ]; then
+              echo "::error::未找到 $SIGN_FILE，无法写入定制签名" >&2
+              exit 1
+            fi
+            if grep -q "$CUSTOM_HASH" "$SIGN_FILE"; then
+              echo "定制签名已存在，跳过插入"
+            else
+              # 在数组起始行后插入一条：{ 0x339, "hash" }, // custom manager
+              echo "aW1wb3J0IHN5cywgcmUKcGF0aCwgc2l6ZSwgaGFzaHZhbCA9IHN5cy5hcmd2WzFdLCBzeXMuYXJndlsyXSwgc3lzLmFyZ3ZbM10Kc3JjID0gb3BlbihwYXRoKS5yZWFkKCkKbSA9IHJlLnNlYXJjaChyJyhhcGtfc2lnbl9rZXlzXFtcXVxzKj1ccypceyknLCBzcmMpCmlmIG5vdCBtOgogICAgc3lzLmV4aXQoIuacquaJvuWIsCBhcGtfc2lnbl9rZXlzIOaVsOe7hCIpCmVudHJ5ID0gJ1xuICAgIHsgJXMsICIlcyIgfSwgLy8gY3VzdG9tIG1hbmFnZXIgKGNvbS5tb2JpbGUudG9vbHMubWFuYWdlciknICUgKHNpemUsIGhhc2h2YWwpCnNyYyA9IHNyY1s6bS5lbmQoKV0gKyBlbnRyeSArIHNyY1ttLmVuZCgpOl0Kb3BlbihwYXRoLCAidyIpLndyaXRlKHNyYykKcHJpbnQoIuW3suaPkuWFpeWumuWItuetvuWQjeWIsCBhcGtfc2lnbl9rZXlzW10iKQo=" | base64 -d > /tmp/insert_sign.py
+              python3 /tmp/insert_sign.py "$SIGN_FILE" "$CUSTOM_SIZE" "$CUSTOM_HASH"
+            fi
+            grep -q "$CUSTOM_HASH" "$SIGN_FILE" || {
+              echo "::error::定制签名未写入 apk_sign.c" >&2; exit 1; }
+            echo "OK: 新版 apk_sign_keys[] 定制签名已写入"
+          fi
 
           echo "=== 定制后的管理器标识 ==="
-          grep -E "^KSU_(PACKAGE_NAME|EXPECTED_SIZE|EXPECTED_HASH) \?=" "$KBUILD_FILE"
-
-          # 校验三项都改到位，否则中止（避免刷入后管理器无权）
-          grep -q "KSU_PACKAGE_NAME ?= $CUSTOM_PKG" "$KBUILD_FILE"
-          grep -q "KSU_EXPECTED_SIZE ?= $CUSTOM_SIZE" "$KBUILD_FILE"
-          grep -q "KSU_EXPECTED_HASH ?= $CUSTOM_HASH" "$KBUILD_FILE"
+          grep -E "KSU_PACKAGE_NAME" "$MKFILE" | head -2
           echo "OK: 包名与签名已写入内核"
 
       # 在内核源码和 KSU 准备完成后再获取 SUSFS，避免在前期集中拉取。
