@@ -679,7 +679,8 @@ jobs:
               KSU_COMMIT="$(grep '^sukisu=' "$GITHUB_WORKSPACE/config/config" | cut -d'=' -f2- | tr -d ' \r\t')"
               [ -n "$KSU_COMMIT" ] || { echo "::error::config/config 未配置 sukisu commit" >&2; exit 1; }
               rm -rf KernelSU
-              git clone --branch builtin --single-branch https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+              # 2026-11-22：官方仓库已从 SukiSU-Ultra 改名 SukiSU-Nova，直接用新地址，不依赖重定向
+              git clone --branch builtin --single-branch https://github.com/SukiSU-Nova/SukiSU-Nova.git KernelSU
               git -C KernelSU checkout "$KSU_COMMIT"
               ACTUAL_HEAD="$(git -C KernelSU rev-parse HEAD)"
               echo "SukiSU 目标 commit: $KSU_COMMIT"
@@ -689,6 +690,12 @@ jobs:
                 exit 1
               fi
               echo "OK: SukiSU 已切到 builtin 分支钉死 commit"
+              # 2026-11-22：断言源码版本标记，确保是 Nova 3.0.0（防止重定向/镜像问题编出旧版）
+              KSU_VERTAG="$(grep -m1 'VERSION_TAG' "$GKI_ROOT/KernelSU/kernel/Makefile" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+              echo "SukiSU VERSION_TAG: $KSU_VERTAG"
+              if [ -n "$KSU_VERTAG" ] && [ "$KSU_VERTAG" != "3.0.0" ]; then
+                echo "::warning::VERSION_TAG 为 $KSU_VERTAG（期望 3.0.0），请确认 config 钉的 commit 是否对应 Nova 3.0.0"
+              fi
               # 复刻 setup.sh 的 drivers 接入（软链 + Makefile + Kconfig）
               DRIVER_DIR="$GKI_ROOT/drivers"
               [ -d "$DRIVER_DIR" ] || DRIVER_DIR="$GKI_ROOT/common/drivers"
