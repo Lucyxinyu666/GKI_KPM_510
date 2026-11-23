@@ -673,7 +673,7 @@ index 60bc765..b5feba4 100644
  
      ksu_extension_register_all();
 diff --git a/kernel/policy/feature.c b/kernel/policy/feature.c
-index 05ae163..7009733 100644
+index 05ae163..ff5dd7a 100644
 --- a/kernel/policy/feature.c
 +++ b/kernel/policy/feature.c
 @@ -1,3 +1,8 @@
@@ -685,7 +685,7 @@ index 05ae163..7009733 100644
  static const struct ksu_feature_handler *feature_handlers[KSU_FEATURE_MAX];
  
  static DEFINE_MUTEX(feature_mutex);
-@@ -10,6 +15,7 @@ static const char *const feature_names[KSU_FEATURE_MAX] = {
+@@ -10,14 +15,15 @@ static const char *const feature_names[KSU_FEATURE_MAX] = {
      [KSU_FEATURE_SELINUX_HIDE] = "selinux_hide",
      [KSU_FEATURE_SHELL_SU_ADB_ONLY] = "shell_su_adb_only",
      [KSU_FEATURE_MOUNT_HIDE] = "mount_hide",
@@ -693,6 +693,63 @@ index 05ae163..7009733 100644
  };
  
  // Features forced by boot config. Written only while parsing module params
+ // (before kernelsu_init), read-only afterwards.
+ static u64 forced_values[KSU_FEATURE_MAX];
+-static DECLARE_BITMAP(forced_mask, KSU_FEATURE_MAX);
++static DECLARE_BITMAP(feature_forced_mask, KSU_FEATURE_MAX);
+ // Forced features whose value has not been applied successfully yet
+-static DECLARE_BITMAP(forced_pending, KSU_FEATURE_MAX);
++static DECLARE_BITMAP(feature_forced_pending, KSU_FEATURE_MAX);
+ 
+ static int parse_feature_id(const char *name, u32 *id)
+ {
+@@ -78,8 +84,8 @@ static int force_feature_param_set(const char *val, const struct kernel_param *k
+         }
+ 
+         forced_values[id] = value;
+-        set_bit(id, forced_mask);
+-        set_bit(id, forced_pending);
++        set_bit(id, feature_forced_mask);
++        set_bit(id, feature_forced_pending);
+         pr_info("feature: %s (id=%u) forced to %llu\n", feature_names[id], id, value);
+     }
+ 
+@@ -205,7 +211,7 @@ int ksu_set_feature(u32 feature_id, u64 value)
+         return -EINVAL;
+     }
+ 
+-    if (test_bit(feature_id, forced_mask)) {
++    if (test_bit(feature_id, feature_forced_mask)) {
+         pr_warn("feature: feature %u is forced by boot config\n", feature_id);
+         return -EPERM;
+     }
+@@ -238,7 +244,7 @@ out:
+ 
+ bool ksu_feature_is_forced(u32 feature_id)
+ {
+-    return feature_id < KSU_FEATURE_MAX && test_bit(feature_id, forced_mask);
++    return feature_id < KSU_FEATURE_MAX && test_bit(feature_id, feature_forced_mask);
+ }
+ 
+ void ksu_feature_apply_forced(void)
+@@ -249,7 +255,7 @@ void ksu_feature_apply_forced(void)
+ 
+     mutex_lock(&feature_mutex);
+ 
+-    for_each_set_bit (id, forced_pending, KSU_FEATURE_MAX) {
++    for_each_set_bit (id, feature_forced_pending, KSU_FEATURE_MAX) {
+         handler = feature_handlers[id];
+         if (!handler || !handler->set_handler) {
+             continue;
+@@ -261,7 +267,7 @@ void ksu_feature_apply_forced(void)
+             continue;
+         }
+ 
+-        clear_bit(id, forced_pending);
++        clear_bit(id, feature_forced_pending);
+         pr_info("feature: applied forced %s=%llu\n", feature_names[id], forced_values[id]);
+     }
+ 
 diff --git a/kernel/runtime/ksud.c b/kernel/runtime/ksud.c
 index 930aa46..abcff1b 100644
 --- a/kernel/runtime/ksud.c

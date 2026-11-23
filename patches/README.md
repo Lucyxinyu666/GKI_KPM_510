@@ -53,6 +53,22 @@ ksud feature list | grep -E 'selinux_hide|avc_spoof'
 dmesg | grep -E 'write_op hooked|slow_avc_audit spoofing enabled'
 ```
 
+### 踩过的坑：`KSU_FEATURE_MAX` 跨过 64
+
+`KSU_FEATURE_MAX` 从 17 抬到 10004 后，`BITS_TO_LONGS()` 从 1 段变成 157 段，
+`policy/feature.c` 的 `DECLARE_BITMAP(forced_mask, ...)` 就和
+`extension/extension.c` 的同名位图在 unity build（两个 .c 都 #include 进
+`ksu_main.o`）里变成“同名不同类型”，编译报：
+
+```
+error: redefinition of 'forced_mask' with a different type:
+       'unsigned long [157]' vs 'unsigned long [1]'
+```
+
+原来两者都是 1 段（`KSU_EXTENSION_MAX` 也很小），所以撞名但类型相同、被静默合并。
+补丁里把 `policy/feature.c` 的那两个改名为 `feature_forced_mask` /
+`feature_forced_pending`，行为不变。
+
 ---
 
 ## 0002 — 让应用的 seccomp 状态正常显示
