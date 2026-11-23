@@ -695,6 +695,40 @@ jobs:
               grep -q "kernelsu" "$DRIVER_DIR/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "$DRIVER_DIR/Makefile"
               grep -q "drivers/kernelsu/Kconfig" "$DRIVER_DIR/Kconfig" || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" "$DRIVER_DIR/Kconfig"
               echo "OK: KernelSU drivers 接入完成"
+
+              # ------------------ 本地功能接线补丁（必须紧跟 clone 之后） ------------------
+              # 上游 builtin（Nova 4bec532）里这些开关是"空壳"或行为与 manager 期望不一致：
+              #   功能 4    隐藏 SELinux 修改：只伪造 /sys/fs/selinux/status，/access 仍返回真实 seqno
+              #             （my_write_access/my_write_context 存在但没有任何调用点 = 死代码）
+              #   功能 10003 AVC 日志伪装   ：内核侧根本没有这个 feature id，manager 显示 NOT_SUPPORTED
+              #   seccomp 显示             ：hook/lsm_hook.c 在 setresuid 时就把 allowlist 应用的 seccomp
+              #                             释放掉（manager 自己也在名单里），PR_GET_SECCOMP 返回 0，
+              #                             首页于是显示"未启用"
+              # 补丁内容见 patches/README.md：
+              #   0001: feature/selinux_hide.c 解析 write_op[] 并替换 /access、/context 写处理函数；
+              #         feature/avc_spoof.c(.h) kprobe slow_avc_audit；hook/patch_memory.* 改写 .rodata；
+              #         include/uapi/feature.h 新增 KSU_FEATURE_AVC_SPOOF = 10003
+              #   0002: hook/lsm_hook.c 不再动应用的 seccomp；改到 feature/sucompat.c 中
+              #         真正 exec su/ksud 的那个子进程释放（应用自身保留 filter）
+              for KSU_LOCAL_PATCH in "$GITHUB_WORKSPACE"/patches/0*.patch; do
+                [ -f "$KSU_LOCAL_PATCH" ] || continue
+                echo "应用本地补丁: $(basename "$KSU_LOCAL_PATCH")"
+                if git -C KernelSU apply --whitespace=nowarn "$KSU_LOCAL_PATCH"; then
+                  echo "OK: $(basename "$KSU_LOCAL_PATCH") 已应用"
+                else
+                  echo "::error::$(basename "$KSU_LOCAL_PATCH") 应用失败，拒绝继续（否则功能静默失效）" >&2
+                  exit 1
+                fi
+              done
+              git -C KernelSU --no-pager diff --stat | tail -n 14
+              # 断言：补丁真的落到了源码里
+              grep -q "KSU_FEATURE_AVC_SPOOF" KernelSU/kernel/include/uapi/feature.h \
+                || { echo "::error::feature.h 未包含 AVC_SPOOF" >&2; exit 1; }
+              grep -q "find_kernel_symbol_exact(\"write_op\")" KernelSU/kernel/feature/selinux_hide.c \
+                || { echo "::error::selinux_hide.c 未接线 write_op" >&2; exit 1; }
+              grep -q "disable_seccomp();" KernelSU/kernel/feature/sucompat.c \
+                || { echo "::error::sucompat.c 未接 seccomp 释放点" >&2; exit 1; }
+              echo "OK: 功能 4 / 10003 / seccomp 显示 内核侧已接线"
               ;;
             "BakaSU")
               echo "添加 BakaSU..."
