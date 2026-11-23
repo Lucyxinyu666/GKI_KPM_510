@@ -1,0 +1,765 @@
+diff --git a/kernel/feature/avc_spoof.c b/kernel/feature/avc_spoof.c
+new file mode 100644
+index 0000000..14a3b79
+--- /dev/null
++++ b/kernel/feature/avc_spoof.c
+@@ -0,0 +1,219 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Adapted from KOWX712/KernelSU avc spoofing (GPL-2.0-only). */
++#include <linux/security.h>
++#include <linux/atomic.h>
++#include <linux/version.h>
++#include <linux/string.h>
++#include <linux/printk.h>
++#include <linux/kprobes.h>
++#include <linux/slab.h>
++
++#include "policy/feature.h"
++#include "feature/avc_spoof.h"
++#include "klog.h"
++#include "arch.h"
++
++/*
++ * AVC logging receives a target SID.  This feature changes only the SID used
++ * for audit rendering; it does not change the AVC decision or SELinux policy.
++ */
++static u32 su_sid;
++static u32 ksu_sid;
++static u32 priv_app_sid;
++
++/* Disabled until SIDs are resolved and the boot-completed hook installs the probe. */
++static atomic_t disable_spoof = ATOMIC_INIT(1);
++static bool ksu_avc_spoof_enabled = true;
++static bool avc_spoof_boot_completed;
++
++static struct kprobe *slow_avc_audit_kp;
++
++static int slow_avc_audit_pre_handler(struct kprobe *p, struct pt_regs *regs)
++{
++    u32 *tsid;
++
++    if (atomic_read(&disable_spoof))
++        return 0;
++
++    /*
++     * slow_avc_audit changed ABI across Android/Linux versions:
++     *   < 6.4: tsid is the third argument
++     * >= 6.4: tsid is the second argument
++     *
++     * This matches the upstream implementation and keeps the probe from
++     * writing to the state/ssid argument on newer kernels.
++     */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
++    tsid = (u32 *)&PT_REGS_PARM2(regs);
++#else
++    tsid = (u32 *)&PT_REGS_PARM3(regs);
++#endif
++
++    if (*tsid == su_sid || *tsid == ksu_sid) {
++        pr_info_ratelimited("avc_spoof: replace tsid %u with %u\n", *tsid, priv_app_sid);
++        *tsid = priv_app_sid;
++    }
++    return 0;
++}
++
++static struct kprobe *init_avc_kprobe(const char *name, kprobe_pre_handler_t handler)
++{
++    struct kprobe *kp = kzalloc(sizeof(*kp), GFP_KERNEL);
++    int ret;
++
++    if (!kp)
++        return NULL;
++
++    kp->symbol_name = name;
++    kp->pre_handler = handler;
++    ret = register_kprobe(kp);
++    pr_info("avc_spoof: register_%s kprobe: %d\n", name, ret);
++    if (ret) {
++        kfree(kp);
++        return NULL;
++    }
++    return kp;
++}
++
++static void destroy_avc_kprobe(struct kprobe **kp_ptr)
++{
++    struct kprobe *kp = *kp_ptr;
++
++    if (!kp)
++        return;
++    unregister_kprobe(kp);
++    synchronize_rcu();
++    kfree(kp);
++    *kp_ptr = NULL;
++}
++
++static int avc_spoof_lookup_sid(const char *secdata, u32 *secid)
++{
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
++    /* 6.8 replaced the u32 out-argument with struct lsm_context. */
++    return -EOPNOTSUPP;
++#else
++    return security_secctx_to_secid(secdata, strlen(secdata), secid);
++#endif
++}
++
++static int get_avc_sids(void)
++{
++    int ret;
++
++    ret = avc_spoof_lookup_sid("u:r:su:s0", &su_sid);
++    if (ret) {
++        pr_info("avc_spoof: su SID not found\n");
++        return ret;
++    }
++    pr_info("avc_spoof: su SID: %u\n", su_sid);
++
++    ret = avc_spoof_lookup_sid("u:r:ksu:s0", &ksu_sid);
++    if (ret) {
++        pr_info("avc_spoof: ksu SID not found\n");
++        return ret;
++    }
++    pr_info("avc_spoof: ksu SID: %u\n", ksu_sid);
++
++    ret = avc_spoof_lookup_sid("u:r:priv_app:s0:c512,c768", &priv_app_sid);
++    if (ret) {
++        pr_info("avc_spoof: priv_app SID not found\n");
++        return ret;
++    }
++    pr_info("avc_spoof: priv_app SID: %u\n", priv_app_sid);
++    return 0;
++}
++
++void ksu_avc_spoof_disable(void)
++{
++    pr_info("avc_spoof: unregister slow_avc_audit kprobe\n");
++    destroy_avc_kprobe(&slow_avc_audit_kp);
++    atomic_set(&disable_spoof, 1);
++    pr_info("avc_spoof: slow_avc_audit spoofing disabled\n");
++}
++
++void ksu_avc_spoof_enable(void)
++{
++    int ret = get_avc_sids();
++
++    if (ret) {
++        pr_info("avc_spoof: SID resolution failed: %d\n", ret);
++        return;
++    }
++
++    if (!slow_avc_audit_kp) {
++        pr_info("avc_spoof: register slow_avc_audit kprobe\n");
++        slow_avc_audit_kp = init_avc_kprobe("slow_avc_audit", slow_avc_audit_pre_handler);
++        if (!slow_avc_audit_kp) {
++            atomic_set(&disable_spoof, 1);
++            pr_err("avc_spoof: failed to register slow_avc_audit kprobe\n");
++            return;
++        }
++    }
++    atomic_set(&disable_spoof, 0);
++    pr_info("avc_spoof: slow_avc_audit spoofing enabled\n");
++}
++
++static int avc_spoof_feature_get(u64 *value)
++{
++    *value = ksu_avc_spoof_enabled ? 1 : 0;
++    return 0;
++}
++
++static int avc_spoof_feature_set(u64 value)
++{
++    bool enable = value != 0;
++
++    if (enable == ksu_avc_spoof_enabled) {
++        pr_info("avc_spoof: no need to change\n");
++        return 0;
++    }
++
++    ksu_avc_spoof_enabled = enable;
++    if (avc_spoof_boot_completed) {
++        if (enable)
++            ksu_avc_spoof_enable();
++        else
++            ksu_avc_spoof_disable();
++    }
++    pr_info("avc_spoof: set to %d\n", enable);
++    return 0;
++}
++
++static const struct ksu_feature_handler avc_spoof_handler = {
++    .feature_id = KSU_FEATURE_AVC_SPOOF,
++    .name = "avc_spoof",
++    .get_handler = avc_spoof_feature_get,
++    .set_handler = avc_spoof_feature_set,
++};
++static bool avc_spoof_registered;
++
++void ksu_avc_spoof_late_init(void)
++{
++    avc_spoof_boot_completed = true;
++    if (ksu_avc_spoof_enabled)
++        ksu_avc_spoof_enable();
++}
++
++void ksu_avc_spoof_init(void)
++{
++    if (!IS_ENABLED(CONFIG_KPROBES)) {
++        pr_warn("avc_spoof: CONFIG_KPROBES is disabled; feature unavailable\n");
++        return;
++    }
++    if (ksu_register_feature_handler(&avc_spoof_handler)) {
++        pr_err("avc_spoof: failed to register feature handler\n");
++        return;
++    }
++    avc_spoof_registered = true;
++}
++
++void ksu_avc_spoof_exit(void)
++{
++    if (ksu_avc_spoof_enabled)
++        ksu_avc_spoof_disable();
++    if (avc_spoof_registered) {
++        ksu_unregister_feature_handler(KSU_FEATURE_AVC_SPOOF);
++        avc_spoof_registered = false;
++    }
++}
+diff --git a/kernel/feature/avc_spoof.h b/kernel/feature/avc_spoof.h
+new file mode 100644
+index 0000000..865b58c
+--- /dev/null
++++ b/kernel/feature/avc_spoof.h
+@@ -0,0 +1,8 @@
++#ifndef __KSU_H_AVC_SPOOF
++#define __KSU_H_AVC_SPOOF
++
++void ksu_avc_spoof_init(void);
++void ksu_avc_spoof_late_init(void);
++void ksu_avc_spoof_exit(void);
++
++#endif
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index ca0c04a..98a2eeb 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -22,6 +22,8 @@
+ #include "avc.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "objsec.h"
++#include "infra/symbol_resolver.h"
++#include "hook/patch_memory.h"
+ 
+ 
+ static DEFINE_MUTEX(selinux_hide_mutex);
+@@ -79,6 +81,24 @@ static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct co
+ #define ksu_task_security_struct cred_security_struct
+ #endif
+ 
++/*
++ * selinuxfs dispatches /context and /access writes through the const table
++ *
++ *   static ssize_t (*const write_op[])(struct file *, char *, size_t)
++ *
++ * so the only way to intercept them is to swap the two table entries.  The
++ * table lives in .rodata, hence ksu_patch_text().
++ */
++typedef ssize_t (*ksu_write_op_fn)(struct file *, char *, size_t);
++
++static ksu_write_op_fn *selinux_write_op;
++static ksu_write_op_fn *context_write_slot;
++static ksu_write_op_fn *access_write_slot;
++static ksu_write_op_fn orig_context_write;
++static ksu_write_op_fn orig_access_write;
++static bool context_write_hooked;
++static bool access_write_hooked;
++
+ ssize_t my_write_context(struct file *file, char *buf, size_t size)
+ {
+     char *canon = NULL;
+@@ -121,6 +141,9 @@ ssize_t my_write_access(struct file *file, char *buf, size_t size)
+     struct av_decision avd;
+     ssize_t length;
+ 
++    if (access_write_hooked && orig_access_write && current_uid().val < 10000)
++        return orig_access_write(file, buf, size);
++
+     length = ksu_avc_has_perm_compat(current_sid(), SECINITSID_SECURITY, SECCLASS_SECURITY, SECURITY__COMPUTE_AV, NULL);
+     if (length)
+         goto out;
+@@ -166,6 +189,67 @@ out:
+     return length;
+ }
+ 
++static int ksu_selinux_hide_hook_write_op(void)
++{
++    ksu_write_op_fn fn;
++    int ret;
++
++    if (access_write_hooked)
++        return 0;
++
++    if (!selinux_write_op) {
++        selinux_write_op = (ksu_write_op_fn *)find_kernel_symbol_exact("write_op");
++        if (!selinux_write_op) {
++            pr_err("selinux_hide: write_op not found, /access stays unpatched\n");
++            return -ENOSYS;
++        }
++        context_write_slot = &selinux_write_op[SEL_CONTEXT];
++        access_write_slot = &selinux_write_op[SEL_ACCESS];
++    }
++
++    orig_context_write = *context_write_slot;
++    orig_access_write = *access_write_slot;
++
++    fn = my_write_context;
++    ret = ksu_patch_text(context_write_slot, &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret) {
++        pr_err("selinux_hide: hook /context failed: %d\n", ret);
++        return ret;
++    }
++    context_write_hooked = true;
++
++    fn = my_write_access;
++    ret = ksu_patch_text(access_write_slot, &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret) {
++        pr_err("selinux_hide: hook /access failed: %d\n", ret);
++        fn = orig_context_write;
++        ksu_patch_text(context_write_slot, &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
++        context_write_hooked = false;
++        return ret;
++    }
++    access_write_hooked = true;
++
++    pr_info("selinux_hide: write_op hooked, /access and /context are spoofed\n");
++    return 0;
++}
++
++static void ksu_selinux_hide_unhook_write_op(void)
++{
++    ksu_write_op_fn fn;
++
++    if (access_write_hooked && access_write_slot) {
++        fn = orig_access_write;
++        if (!ksu_patch_text(access_write_slot, &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE))
++            access_write_hooked = false;
++    }
++    if (context_write_hooked && context_write_slot) {
++        fn = orig_context_write;
++        if (!ksu_patch_text(context_write_slot, &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE))
++            context_write_hooked = false;
++    }
++    pr_info("selinux_hide: write_op restored\n");
++}
++
+ /*
+  * get the security ID of a set of credentials
+  */
+@@ -346,12 +430,20 @@ void ksu_selinux_hide_handle_post_fs_data()
+ 
+ static int ksu_selinux_hide_enable()
+ {
++    int ret;
++
+     pr_info("selinux_hide: init selinux hide\n");
+     if (!backup_sepolicy) {
+         pr_err("no backup sepolicy available, please save feature and reboot to retry!\n");
+         return -EAGAIN;
+     }
+ 
++    ret = ksu_selinux_hide_hook_write_op();
++    if (ret) {
++        pr_err("selinux_hide: failed to hook selinuxfs write handlers: %d\n", ret);
++        return ret;
++    }
++
+     return 0;
+ }
+ 
+@@ -377,6 +469,7 @@ static int selinux_hide_feature_set(u64 value)
+         }
+     } else {
+         if (ksu_selinux_hide_running) {
++            ksu_selinux_hide_unhook_write_op();
+             ksu_selinux_hide_running = false;
+         }
+     }
+@@ -405,6 +498,7 @@ void __exit ksu_selinux_hide_exit()
+ {
+     mutex_lock(&selinux_hide_mutex);
+     if (ksu_selinux_hide_running) {
++        ksu_selinux_hide_unhook_write_op();
+         ksu_selinux_hide_running = false;
+     }
+     mutex_unlock(&selinux_hide_mutex);
+diff --git a/kernel/hook/arm64/patch_memory.c b/kernel/hook/arm64/patch_memory.c
+new file mode 100644
+index 0000000..4522992
+--- /dev/null
++++ b/kernel/hook/arm64/patch_memory.c
+@@ -0,0 +1,177 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2023 bmax121. All Rights Reserved.
++ *
++ * Poke any kernel address (rodata, function-pointer tables, text) through a
++ * fixmap alias while every CPU is stopped.  Used by feature/selinux_hide.c to
++ * swap the selinuxfs write handlers.
++ */
++
++#ifdef __aarch64__
++
++#include "../patch_memory.h"
++#include "klog.h" // IWYU pragma: keep
++#include "linux/cpumask.h"
++#include "linux/gfp.h" // IWYU pragma: keep
++#include "linux/mm.h"
++#include "linux/uaccess.h"
++#include "linux/stop_machine.h"
++#include "asm/cacheflush.h"
++#include "asm-generic/fixmap.h"
++
++/* Android 12 5.10 has no dcache_clean_inval_poc(), keep the fallback. */
++#ifndef KSU_NEW_DCACHE_FLUSH
++#define KSU_NEW_DCACHE_FLUSH 0
++#endif
++
++// Translate a kernel virtual address to a physical address by walking the
++// init_mm page tables. Returns the physical address on success, or writes
++// a non-zero error to *err.
++unsigned long phys_from_virt(unsigned long addr, int *err)
++{
++    struct mm_struct *mm = &init_mm;
++    pgd_t *pgd;
++    p4d_t *p4d;
++    pud_t *pud;
++    pmd_t *pmd;
++    pte_t *pte;
++
++    *err = 0;
++
++    pgd = pgd_offset(mm, addr);
++    if (pgd_none(*pgd) || pgd_bad(*pgd))
++        goto fail;
++
++    p4d = p4d_offset(pgd, addr);
++    if (p4d_none(*p4d) || p4d_bad(*p4d))
++        goto fail;
++#if defined(p4d_leaf)
++    if (p4d_leaf(*p4d)) {
++        return __p4d_to_phys(*p4d) + ((addr & ~P4D_MASK));
++    }
++#endif
++
++    pud = pud_offset(p4d, addr);
++    if (pud_none(*pud) || pud_bad(*pud))
++        goto fail;
++#if defined(pud_leaf)
++    if (pud_leaf(*pud)) {
++        return __pud_to_phys(*pud) + ((addr & ~PUD_MASK));
++    }
++#endif
++
++    pmd = pmd_offset(pud, addr);
++#if defined(pmd_leaf)
++    if (pmd_leaf(*pmd)) {
++        return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
++    }
++#endif
++
++    if (pmd_none(*pmd) || pmd_bad(*pmd))
++        goto fail;
++
++    pte = pte_offset_kernel(pmd, addr);
++    if (!pte)
++        goto fail;
++    if (!pte_present(*pte))
++        goto fail;
++
++    return __pte_to_phys(*pte) + ((addr & ~PAGE_MASK));
++
++fail:
++    *err = -ENOENT;
++    return 0;
++}
++
++#if KSU_NEW_DCACHE_FLUSH
++#define ksu_flush_dcache(start, sz)                                                                                    \
++    ({                                                                                                                 \
++        unsigned long __start = (start);                                                                               \
++        unsigned long __end = __start + (sz);                                                                          \
++        dcache_clean_inval_poc(__start, __end);                                                                        \
++    })
++#define ksu_flush_icache(start, end) caches_clean_inval_pou(start, end)
++#else
++#define ksu_flush_dcache(start, sz) __flush_dcache_area((void *)start, sz)
++#define ksu_flush_icache(start, end) __flush_icache_range(start, end)
++#endif
++
++struct patch_text_info {
++    void *dst;
++    void *src;
++    size_t len;
++    atomic_t cpu_count;
++    int flags;
++};
++
++// Runs under stop_machine; propagate errors without console output.
++static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
++{
++    unsigned long p = (unsigned long)dst;
++    int ret;
++
++    int phy_err;
++    unsigned long phy = phys_from_virt(p, &phy_err);
++    if (phy_err) {
++        ret = phy_err;
++        goto err;
++    }
++
++    void *map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
++
++    ret = (int)copy_to_kernel_nofault(map, src, len);
++
++    clear_fixmap(FIX_TEXT_POKE0);
++
++    if (!ret) {
++        if (flags & KSU_PATCH_TEXT_FLUSH_ICACHE)
++            ksu_flush_icache((uintptr_t)dst, (uintptr_t)dst + len);
++        if (flags & KSU_PATCH_TEXT_FLUSH_DCACHE)
++            ksu_flush_dcache(dst, len);
++    }
++
++err:
++    return ret;
++}
++
++static int ksu_patch_text_cb(void *arg)
++{
++    struct patch_text_info *pp = arg;
++    void *dst = pp->dst, *src = pp->src;
++    size_t len = pp->len;
++    int flags = pp->flags;
++
++    int ret = 0;
++
++    /* The last CPU becomes master */
++    if (atomic_inc_return(&pp->cpu_count) == num_online_cpus()) {
++        ret = ksu_patch_text_nosync(dst, src, len, flags);
++        /* Notify other processors with an additional increment. */
++        atomic_inc(&pp->cpu_count);
++    } else {
++        while (atomic_read(&pp->cpu_count) <= num_online_cpus())
++            cpu_relax();
++        isb();
++    }
++
++    return ret;
++}
++
++int ksu_patch_text(void *dst, void *src, size_t len, int flags)
++{
++    int ret;
++    struct patch_text_info info = {
++        .dst = dst,
++        .src = src,
++        .len = len,
++        .cpu_count = ATOMIC_INIT(0),
++        .flags = flags,
++    };
++
++    ret = stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);
++    if (ret)
++        pr_err("failed to patch kernel address 0x%lx: %d\n", (unsigned long)dst, ret);
++    return ret;
++}
++
++#endif /* __aarch64__ */
+diff --git a/kernel/hook/patch_memory.h b/kernel/hook/patch_memory.h
+new file mode 100644
+index 0000000..658225a
+--- /dev/null
++++ b/kernel/hook/patch_memory.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2023 bmax121. All Rights Reserved.
++ */
++
++#ifndef __KSU_PATCH_MEMORY_H
++#define __KSU_PATCH_MEMORY_H
++
++#include <linux/types.h>
++#include "linux/version.h"
++
++#ifdef __aarch64__
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++#include "asm/text-patching.h" // IWYU pragma: keep
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
++#include "asm/patching.h" // IWYU pragma: keep
++#else
++#include "asm/insn.h" // IWYU pragma: keep
++#endif
++#include <asm/fixmap.h>
++#include <asm-generic/fixmap.h>
++#elif defined(__x86_64__) || defined(__riscv)
++#include <asm/ptrace.h>
++#endif
++
++#define KSU_PATCH_TEXT_FLUSH_DCACHE 1
++#define KSU_PATCH_TEXT_FLUSH_ICACHE 2
++
++#ifdef __aarch64__
++unsigned long phys_from_virt(unsigned long addr, int *err);
++int ksu_patch_text(void *dst, void *src, size_t len, int flags);
++#endif
++
++#endif
+diff --git a/kernel/include/uapi/feature.h b/kernel/include/uapi/feature.h
+index df0acd2..1a638c5 100644
+--- a/kernel/include/uapi/feature.h
++++ b/kernel/include/uapi/feature.h
+@@ -16,6 +16,14 @@ enum ksu_feature_id {
+      */
+     KSU_FEATURE_MOUNT_HIDE = 16,
+ 
++    /*
++     * AVC log spoofing: rewrites the target SID handed to slow_avc_audit() so
++     * denials caused by the su/ksu domain are rendered as priv_app ones.
++     * The id is fixed by the manager (ksud feature::AvcSpoof = 10003), so it
++     * must stay where the fork put it.
++     */
++    KSU_FEATURE_AVC_SPOOF = 10003,
++
+     KSU_FEATURE_MAX
+ };
+ 
+diff --git a/kernel/ksu_main.c b/kernel/ksu_main.c
+index 60bc765..b5feba4 100644
+--- a/kernel/ksu_main.c
++++ b/kernel/ksu_main.c
+@@ -39,6 +39,7 @@
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ #include "feature/selinux_hide.h"
+ #endif
++#include "feature/avc_spoof.h"
+ #include "feature/shell_su_adb_only.h"
+ #include "runtime/ksud.h"
+ #include "sulog/event.h"
+@@ -116,6 +117,10 @@
+ #include "infra/file_wrapper.c"
+ #include "infra/event_queue.c"
+ 
++#ifdef CONFIG_ARM64
++#include "hook/arm64/patch_memory.c"
++#endif
++
+ #ifdef CONFIG_KSU_FEATURE_ADBROOT
+ #include "feature/adb_root.c"
+ #endif
+@@ -125,6 +130,7 @@
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ #include "feature/selinux_hide.c"
+ #endif
++#include "feature/avc_spoof.c"
+ #include "feature/shell_su_adb_only.c"
+ #include "feature/mount_hide.c"
+ #include "runtime/ksud.c"
+@@ -177,6 +183,8 @@ int __init kernelsu_init(void)
+ 
+     ksu_feature_init();
+ 
++    ksu_avc_spoof_init();
++
+     ksu_extension_init();
+ 
+     ksu_extension_register_all();
+diff --git a/kernel/policy/feature.c b/kernel/policy/feature.c
+index 05ae163..ff5dd7a 100644
+--- a/kernel/policy/feature.c
++++ b/kernel/policy/feature.c
+@@ -1,3 +1,8 @@
++/*
++ * Indexed directly by feature id: the manager addresses features by number, so
++ * the sparse fork-local id 10003 (avc_spoof) costs ~80 KiB rodata + ~160 KiB
++ * BSS but keeps every lookup a plain array index.
++ */
+ static const struct ksu_feature_handler *feature_handlers[KSU_FEATURE_MAX];
+ 
+ static DEFINE_MUTEX(feature_mutex);
+@@ -10,14 +15,15 @@ static const char *const feature_names[KSU_FEATURE_MAX] = {
+     [KSU_FEATURE_SELINUX_HIDE] = "selinux_hide",
+     [KSU_FEATURE_SHELL_SU_ADB_ONLY] = "shell_su_adb_only",
+     [KSU_FEATURE_MOUNT_HIDE] = "mount_hide",
++    [KSU_FEATURE_AVC_SPOOF] = "avc_spoof",
+ };
+ 
+ // Features forced by boot config. Written only while parsing module params
+ // (before kernelsu_init), read-only afterwards.
+ static u64 forced_values[KSU_FEATURE_MAX];
+-static DECLARE_BITMAP(forced_mask, KSU_FEATURE_MAX);
++static DECLARE_BITMAP(feature_forced_mask, KSU_FEATURE_MAX);
+ // Forced features whose value has not been applied successfully yet
+-static DECLARE_BITMAP(forced_pending, KSU_FEATURE_MAX);
++static DECLARE_BITMAP(feature_forced_pending, KSU_FEATURE_MAX);
+ 
+ static int parse_feature_id(const char *name, u32 *id)
+ {
+@@ -78,8 +84,8 @@ static int force_feature_param_set(const char *val, const struct kernel_param *k
+         }
+ 
+         forced_values[id] = value;
+-        set_bit(id, forced_mask);
+-        set_bit(id, forced_pending);
++        set_bit(id, feature_forced_mask);
++        set_bit(id, feature_forced_pending);
+         pr_info("feature: %s (id=%u) forced to %llu\n", feature_names[id], id, value);
+     }
+ 
+@@ -205,7 +211,7 @@ int ksu_set_feature(u32 feature_id, u64 value)
+         return -EINVAL;
+     }
+ 
+-    if (test_bit(feature_id, forced_mask)) {
++    if (test_bit(feature_id, feature_forced_mask)) {
+         pr_warn("feature: feature %u is forced by boot config\n", feature_id);
+         return -EPERM;
+     }
+@@ -238,7 +244,7 @@ out:
+ 
+ bool ksu_feature_is_forced(u32 feature_id)
+ {
+-    return feature_id < KSU_FEATURE_MAX && test_bit(feature_id, forced_mask);
++    return feature_id < KSU_FEATURE_MAX && test_bit(feature_id, feature_forced_mask);
+ }
+ 
+ void ksu_feature_apply_forced(void)
+@@ -249,7 +255,7 @@ void ksu_feature_apply_forced(void)
+ 
+     mutex_lock(&feature_mutex);
+ 
+-    for_each_set_bit (id, forced_pending, KSU_FEATURE_MAX) {
++    for_each_set_bit (id, feature_forced_pending, KSU_FEATURE_MAX) {
+         handler = feature_handlers[id];
+         if (!handler || !handler->set_handler) {
+             continue;
+@@ -261,7 +267,7 @@ void ksu_feature_apply_forced(void)
+             continue;
+         }
+ 
+-        clear_bit(id, forced_pending);
++        clear_bit(id, feature_forced_pending);
+         pr_info("feature: applied forced %s=%llu\n", feature_names[id], forced_values[id]);
+     }
+ 
+diff --git a/kernel/runtime/ksud.c b/kernel/runtime/ksud.c
+index 930aa46..abcff1b 100644
+--- a/kernel/runtime/ksud.c
++++ b/kernel/runtime/ksud.c
+@@ -58,6 +58,8 @@ void on_post_fs_data(void)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+     ksu_selinux_hide_handle_post_fs_data();
+ #endif
++    // selinux policy is fully loaded now, resolve the SIDs and arm the probe
++    ksu_avc_spoof_late_init();
+     // retry forced features which failed at second stage
+     ksu_feature_apply_forced();
+     ksu_extension_apply_forced();

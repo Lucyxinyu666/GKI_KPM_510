@@ -71,7 +71,7 @@ on:
         options:
           - "仅上传 AnyKernel3.zip"
           - "上传全部"
-        default: "上传全部"
+        default: "仅上传 AnyKernel3.zip"
       kmi_tag:
         description: "覆盖 KMI 标签（如 android14-11），留空按内置映射"
         required: false

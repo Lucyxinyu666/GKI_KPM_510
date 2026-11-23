@@ -1,0 +1,102 @@
+diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
+index f458e56..4b20c3e 100644
+--- a/kernel/feature/sucompat.c
++++ b/kernel/feature/sucompat.c
+@@ -40,6 +40,14 @@ static char __user *ksud_user_path(void)
+ 
+ 
+ #ifdef CONFIG_KSU_SUSFS
++/*
++ * Defined in policy/app_profile.c.  Apps keep the seccomp filter zygote gave
++ * them (so PR_GET_SECCOMP and /proc/self/status look stock), and the filter is
++ * released here - only in the child that is about to become su/ksud, because
++ * the Android app policy blocks the privileged syscalls a root shell needs.
++ */
++extern void disable_seccomp(void);
++
+ /*
+  * return 0 -> No further checks should be required afterwards
+  * return non-zero -> Further checks should be continued afterwards
+@@ -131,6 +139,12 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+ 
+     ret = escape_with_root_profile();
+ 
++    if (!ret) {
++        /* This task is about to exec ksud as root: drop the app seccomp filter
++         * for it alone, the calling app keeps its own. */
++        disable_seccomp();
++    }
++
+     pr_info("ksu_handle_execveat_sucompat: su->ksud!\n");
+     memcpy((void *)filename->name, ksud_path, sizeof(ksud_path));
+ 
+diff --git a/kernel/hook/lsm_hook.c b/kernel/hook/lsm_hook.c
+index cf05225..fa24196 100644
+--- a/kernel/hook/lsm_hook.c
++++ b/kernel/hook/lsm_hook.c
+@@ -16,10 +16,12 @@ static int ksu_key_permission(key_ref_t key_ref, const struct cred *cred, unsign
+ }
+ #endif
+ 
++/* policy/app_profile.c - releases the current task's seccomp filter. */
++extern void disable_seccomp(void);
++
+ #ifdef CONFIG_KSU_SUSFS
+ extern u32 susfs_zygote_sid;
+ extern u32 susfs_zygote_next_sid;
+-extern void disable_seccomp(void);
+ extern struct work_struct susfs_extra_works;
+ 
+ static inline void ksu_handle_extra_susfs_work(void)
+@@ -41,9 +43,11 @@ static int handle_zygote_setresuid(uid_t ruid) {
+     // - Since ksu maanger app uid is excluded in allow_list_arr, so ksu_uid_should_umount(manager_uid)
+     //   will always return true, that's why we need to explicitly check if new_uid belongs to
+     //   ksu manager.
+-    // - Disable seccomp restriction for KSU manager since running with "su" will disable seccomp anyway
++    // - Do NOT drop the seccomp filter here: the manager must keep the filter
++    //   zygote installed, otherwise PR_GET_SECCOMP reports 0 and the manager
++    //   home screen shows "Seccomp: disabled".  The filter is released in the
++    //   child that actually execs su/ksud, see feature/sucompat.c.
+     if (likely(ksu_is_manager_appid_valid()) && unlikely(is_uid_manager(ruid))) {
+-        disable_seccomp();
+         pr_info("install fd for manager: %d\n", ruid);
+         ksu_install_fd();
+         return 0;
+@@ -57,9 +61,9 @@ static int handle_zygote_setresuid(uid_t ruid) {
+         goto do_umount;
+     }
+ 
+-    // Disable seccomp restriction for root allowed apps since running with "su" will disable seccomp anyway
++    // Root allowed apps keep their seccomp filter as well (same reason as the
++    // manager above).  Only the su/ksud child loses it, at exec time.
+     if (ksu_is_allow_uid_for_current(ruid)) {
+-        disable_seccomp();
+         return 0;
+     }
+ 
+@@ -91,9 +95,11 @@ static int handle_zygote_next_setresuid(uid_t ruid) {
+     // - Since ksu maanger app uid is excluded in allow_list_arr, so ksu_uid_should_umount(manager_uid)
+     //   will always return true, that's why we need to explicitly check if new_uid belongs to
+     //   ksu manager.
+-    // - Disable seccomp restriction for KSU manager since running with "su" will disable seccomp anyway
++    // - Do NOT drop the seccomp filter here: the manager must keep the filter
++    //   zygote installed, otherwise PR_GET_SECCOMP reports 0 and the manager
++    //   home screen shows "Seccomp: disabled".  The filter is released in the
++    //   child that actually execs su/ksud, see feature/sucompat.c.
+     if (likely(ksu_is_manager_appid_valid()) && unlikely(is_uid_manager(ruid))) {
+-        disable_seccomp();
+         pr_info("install fd for manager: %d\n", ruid);
+         ksu_install_fd();
+         return 0;
+@@ -108,9 +114,9 @@ static int handle_zygote_next_setresuid(uid_t ruid) {
+         goto do_susfs_work;
+     }
+ 
+-    // Disable seccomp restriction for root allowed apps since running with "su" will disable seccomp anyway
++    // Root allowed apps keep their seccomp filter as well (same reason as the
++    // manager above).  Only the su/ksud child loses it, at exec time.
+     if (ksu_is_allow_uid_for_current(ruid)) {
+-        disable_seccomp();
+         return 0;
+     }
+ 
