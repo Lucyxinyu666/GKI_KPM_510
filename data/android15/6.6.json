@@ -2,7 +2,7 @@
   "android_version": "android15",
   "kernel_version": "6.6",
   "deprecated_cutoff": "",
-  "lts": null,
+  "lts": "6.6.162",
   "entries": [
     {
       "date": "2024-10",
@@ -30,9 +30,24 @@
       "ref": "refs/heads/deprecated/android15-6.6-2025-02"
     },
     {
+      "date": "2025-03",
+      "kernel": "6.6.77",
+      "ref": "refs/heads/deprecated/android15-6.6-2025-03"
+    },
+    {
       "date": "2025-04",
       "kernel": "6.6.82",
       "ref": "refs/heads/deprecated/android15-6.6-2025-04"
+    },
+    {
+      "date": "2025-05",
+      "kernel": "6.6.87",
+      "ref": "refs/heads/deprecated/android15-6.6-2025-05"
+    },
+    {
+      "date": "2025-06",
+      "kernel": "6.6.89",
+      "ref": "refs/heads/deprecated/android15-6.6-2025-06"
     },
     {
       "date": "2025-07",
@@ -43,6 +58,11 @@
       "date": "2025-08",
       "kernel": "6.6.98",
       "ref": "refs/tags/android15-6.6-2025-08_r35"
+    },
+    {
+      "date": "2025-09",
+      "kernel": "6.6.98",
+      "ref": "refs/heads/android15-6.6-2025-09"
     },
     {
       "date": "2025-10",
@@ -63,6 +83,11 @@
       "date": "2026-07",
       "kernel": "6.6.139",
       "ref": "refs/heads/android15-6.6-2026-07"
+    },
+    {
+      "date": "2026-10",
+      "kernel": "6.6.143",
+      "ref": "refs/heads/android15-6.6-2026-10"
     }
   ]
 }

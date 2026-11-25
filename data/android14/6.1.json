@@ -5,14 +5,29 @@
   "lts": "6.1.192",
   "entries": [
     {
+      "date": "2023-06",
+      "kernel": "6.1.25",
+      "ref": "refs/heads/deprecated/android14-6.1-2023-06"
+    },
+    {
       "date": "2023-07",
       "kernel": "6.1.25",
       "ref": "refs/heads/deprecated/android14-6.1-2023-07"
     },
     {
+      "date": "2023-08",
+      "kernel": "6.1.25",
+      "ref": "refs/heads/deprecated/android14-6.1-2023-08"
+    },
+    {
       "date": "2023-09",
       "kernel": "6.1.25",
       "ref": "refs/heads/deprecated/android14-6.1-2023-09"
+    },
+    {
+      "date": "2023-10",
+      "kernel": "6.1.25",
+      "ref": "refs/heads/deprecated/android14-6.1-2023-10"
     },
     {
       "date": "2023-11",
@@ -53,6 +68,16 @@
       "date": "2024-06",
       "kernel": "6.1.78",
       "ref": "refs/heads/deprecated/android14-6.1-2024-06"
+    },
+    {
+      "date": "2024-07",
+      "kernel": "6.1.84",
+      "ref": "refs/heads/deprecated/android14-6.1-2024-07"
+    },
+    {
+      "date": "2024-08",
+      "kernel": "6.1.90",
+      "ref": "refs/heads/deprecated/android14-6.1-2024-08"
     },
     {
       "date": "2024-09",
@@ -108,6 +133,16 @@
       "date": "2025-07",
       "kernel": "6.1.141",
       "ref": "refs/tags/android14-6.1-2025-07_r13"
+    },
+    {
+      "date": "2025-08",
+      "kernel": "6.1.145",
+      "ref": "refs/tags/android14-6.1-2025-08_r12"
+    },
+    {
+      "date": "2025-09",
+      "kernel": "6.1.145",
+      "ref": "refs/heads/android14-6.1-2025-09"
     },
     {
       "date": "2025-12",
